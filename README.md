@@ -10,7 +10,7 @@ Blender add-on for import/export of Daikatana models (.dkm)
 
 # Usage Manual
   
-####**Note: the .WAL format used by Daikatana is a different format from Quake 2's .WAL format, despite sharing its file extension. Do not attempt to use Q2 WALs with this addon.**
+### **Note: the .WAL format used by Daikatana is a different format from Quake 2's .WAL format, despite sharing its file extension. Do not attempt to use Q2 WALs with this addon.**
   
 ## Import
 ![Import DKM menu](https://i.imgur.com/7R2g0Wt.png)  
