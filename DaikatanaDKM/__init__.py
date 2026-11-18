@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Daikatana models (.dkm)",
     "author": "Jakub Majewski",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (5, 2, 3),
     "location": "File > Import-Export",
     "description": "Import and Export Daikatana's .DKM models.",

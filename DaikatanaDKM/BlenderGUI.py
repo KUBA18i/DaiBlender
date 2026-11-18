@@ -4,7 +4,8 @@ from bpy.props import StringProperty, IntProperty, BoolProperty, FloatProperty
 from bpy_extras.io_utils import ImportHelper, ExportHelper
 from pathlib import Path
 
-from .BlenderIO import import_dkm_file, export_dkm_file
+from .BlenderImport import import_dkm_file
+from .BlenderExport import export_dkm_file
 
 DK_icon = None
 
@@ -34,6 +35,15 @@ class DKM_OT_import(bpy.types.Operator, ImportHelper):
         default=False
     )
 
+    ImportTextures: BoolProperty(
+        name="Import textures",
+        description="If checked, the importer will try to find files specified in the skin paths."
+        "\nFirst, they will be searched in the same folder as the model, and if that fails,"
+        "\nskin paths will be used to find the actual path. Files will be searched in this order:"
+        "\n.wal -> .pcx -> .tga -> .bmp -> .png",
+        default=True
+    )
+
     ImportAnimations: BoolProperty(
         name="Import animations",
         description="If checked, animation frames will be imported as relative Shape Keys.",
@@ -61,6 +71,7 @@ class DKM_OT_import(bpy.types.Operator, ImportHelper):
         box1.label(text="Basic settings", icon="OBJECT_DATA")
         box1.prop(self, "BaseFrame")
         box1.prop(self, "UVsFromGLCommands")
+        box1.prop(self, "ImportTextures")
 
         box2 = layout.box()
         box2.label(text="Animation", icon="ANIM_DATA")
@@ -72,7 +83,7 @@ class DKM_OT_import(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         try:
-            import_dkm_file(self.filepath, self.BaseFrame, self.UVsFromGLCommands, self.ImportAnimations, int(self.TimelineMarkerOptions))
+            import_dkm_file(self.filepath, self.BaseFrame, self.UVsFromGLCommands, self.ImportAnimations, int(self.TimelineMarkerOptions), self.ImportTextures)
             self.report({'INFO'}, f"Successfully imported {os.path.basename(self.filepath)}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to import DKM: {str(e)}")
@@ -97,7 +108,7 @@ class DKM_OT_export(bpy.types.Operator, ExportHelper):
 
     ModelVersion: bpy.props.EnumProperty(
         name="Model Version",
-        description="Version 1 models use 8-bit vertex coordinates, whereas Version 2 packs them into a single unsigned 64-bit integer, split into 11-10-11 bits per coordinate.\n\nUse V1 for smaller filesize, or V2 for higher precision.",
+        description="Version 1 models use 8-bit vertex coordinates, whereas Version 2 packs them into a single unsigned 32-bit integer, split into 11-10-11 bits per coordinate.\n\nUse V1 for smaller filesize, or V2 for higher precision.",
         items=[
             ('1', "Version 1", "8-bit vertices"),
             ('2', "Version 2", "11/10/11-bit vertices"),
@@ -114,6 +125,12 @@ class DKM_OT_export(bpy.types.Operator, ExportHelper):
     SurfacesFromVertexGroups: BoolProperty(
         name="Create surfaces from vertex groups.",
         description="If checked, vertex groups will be used to create surfaces, if named in the specified format. If unchecked, a single default surface will be made, pointing to the first skin.\nThe name format is: DKM__<Surface name>__<Skin number>.<Flag value>",
+        default = True
+    )
+
+    ExportTextures: BoolProperty(
+        name="Export textures",
+        description="If checked, material textures will be exported in the same folder as the model, in the format specified by the skin path.",
         default = True
     )
 
@@ -175,6 +192,7 @@ class DKM_OT_export(bpy.types.Operator, ExportHelper):
         box1.label(text="Model Properties", icon="OBJECT_DATA")
         box1.prop(self, "ModelVersion")
         box1.prop(self, "Origin")
+        box1.prop(self, "ExportTextures")
         box1.prop(self, "SurfacesFromVertexGroups")
 
         box2 = layout.box()
@@ -196,7 +214,7 @@ class DKM_OT_export(bpy.types.Operator, ExportHelper):
             if not objs:
                 self.report({'ERROR'}, "Select at least one mesh object to export")
                 return {'CANCELLED'}
-            export_dkm_file(self.filepath, objs, int(self.ModelVersion), list(self.Origin), self.SurfacesFromVertexGroups, self.ExportAnimations, self.FramesFromMarkers, self.StartFrame, self.EndFrame, int(self.AnimSeqOptions))
+            export_dkm_file(self.filepath, objs, int(self.ModelVersion), list(self.Origin), self.SurfacesFromVertexGroups, self.ExportAnimations, self.FramesFromMarkers, self.StartFrame, self.EndFrame, int(self.AnimSeqOptions), self.ExportTextures)
             self.report({'INFO'}, f"Successfully exported {os.path.basename(self.filepath)}")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to export DKM: {str(e)}")
@@ -217,7 +235,7 @@ def register_icon():
     global DK_icon
     import bpy.utils.previews
     DK_icon = bpy.utils.previews.new()
-    icon_path = Path(__file__).parent / "icon.png"
+    icon_path = Path(__file__).parent / "icon.svg"
 
     if icon_path.exists():
         DK_icon.load("dkm_icon", str(icon_path), 'IMAGE')

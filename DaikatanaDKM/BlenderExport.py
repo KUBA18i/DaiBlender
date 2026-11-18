@@ -1,8 +1,7 @@
-import bpy, re, struct, bmesh
+import bpy, re, struct, zlib, bmesh
 import numpy as np
 from pathlib import Path
-from collections.abc import Sequence
-from .DKM_IO import read_dkm, write_dkm
+from .DKM_IO import write_dkm
 from .DKMtypes import (
     DKMFile,
     DKMHeader,
@@ -15,240 +14,8 @@ from .DKMtypes import (
     DKMSurface,
     DKMAnimSeq,
 )
-
-def import_dkm_file(filepath: str | Path, base_frame_index: int, UVsFromGLCommands: bool, ImportAnimations: bool, TimelineMarkerOptions: int):
-    filepath = Path(filepath)
-    dkm_data = read_dkm(filepath)
-
-    if not dkm_data.frames:
-        print("Error: No frames found in the DKM file.")
-        return None
-
-    base_idx = min(max(0, base_frame_index), len(dkm_data.frames) - 1)
-    base_frame = dkm_data.frames[base_idx]
-
-    scale = base_frame.scale
-    translate = base_frame.translate
-
-    base_vertices = []
-    for v in base_frame.vertices:
-        x = v.vertex[0] * scale[0] + translate[0]
-        y = v.vertex[1] * scale[1] + translate[1]
-        z = v.vertex[2] * scale[2] + translate[2]
-        base_vertices.append((x, y, z))
-
-    faces = []
-    uv_loops = []
-    poly_material_indices = []
-
-    surface_vertex_maps = {i: set() for i in range(len(dkm_data.surfaces))}
-    if UVsFromGLCommands:
-        for glc in dkm_data.GLCommands:
-            count = glc.count
-            if count == 0:
-                continue
-
-            surf_idx = glc.surfIndex
-            skin_idx = glc.skinIndex
-            if dkm_data.surfaces and 0 <= surf_idx < len(dkm_data.surfaces):
-                skin_idx = dkm_data.surfaces[surf_idx].skinIndex
-
-            mat_idx = skin_idx if 0 <= skin_idx < (len(dkm_data.skinpaths) if dkm_data.skinpaths else 1) else 0
-            verts = glc.vertices
-            num_verts = len(verts)
-
-            if num_verts < 3:
-                continue
-
-            #positive for strip, negative for fan
-            if count < 0:
-                #Fan
-                hub = verts[0]
-                if surf_idx in surface_vertex_maps:
-                    surface_vertex_maps[surf_idx].add(hub.vertexIndex)
-
-                for i in range(1, num_verts - 1):
-                    v1 = verts[i]
-                    v2 = verts[i + 1]
-
-                    faces.append((hub.vertexIndex, v2.vertexIndex, v1.vertexIndex)) #reversed winding to fix normal flipping
-                    uv_loops.append((hub.s, 1.0 - hub.t))
-                    uv_loops.append((v2.s, 1.0 - v2.t))
-                    uv_loops.append((v1.s, 1.0 - v1.t))
-                    poly_material_indices.append(mat_idx)
-
-                    if surf_idx in surface_vertex_maps:
-                        surface_vertex_maps[surf_idx].add(v1.vertexIndex)
-                        surface_vertex_maps[surf_idx].add(v2.vertexIndex)
-            else:
-                #Strip
-                for i in range(num_verts - 2):
-                    v0 = verts[i]
-                    v1 = verts[i + 1]
-                    v2 = verts[i + 2]
-
-                    if i % 2 == 0:
-                        faces.append((v0.vertexIndex, v2.vertexIndex, v1.vertexIndex)) #reversed winding to fix normal flipping
-                        uv_loops.append((v0.s, 1.0 - v0.t))
-                        uv_loops.append((v2.s, 1.0 - v2.t))
-                        uv_loops.append((v1.s, 1.0 - v1.t))
-                    else:
-                        faces.append((v0.vertexIndex, v1.vertexIndex, v2.vertexIndex)) #this one has non-reversed winding though
-                        uv_loops.append((v0.s, 1.0 - v0.t))
-                        uv_loops.append((v1.s, 1.0 - v1.t))
-                        uv_loops.append((v2.s, 1.0 - v2.t))
-
-                    poly_material_indices.append(mat_idx)
-
-                    if surf_idx in surface_vertex_maps:
-                        surface_vertex_maps[surf_idx].add(v0.vertexIndex)
-                        surface_vertex_maps[surf_idx].add(v1.vertexIndex)
-                        surface_vertex_maps[surf_idx].add(v2.vertexIndex)
-
-    else:
-        for tri in dkm_data.triangles:
-            faces.append((tri.vertexIndices[0], tri.vertexIndices[2], tri.vertexIndices[1])) #reversed winding to fix normal flipping
-
-            if tri.surfaceIndex in surface_vertex_maps:
-                for v_idx in tri.vertexIndices:
-                    surface_vertex_maps[tri.surfaceIndex].add(v_idx)
-
-            surf = dkm_data.surfaces[tri.surfaceIndex] if dkm_data.surfaces and 0 <= tri.surfaceIndex < len(
-                dkm_data.surfaces) else None
-            s_width = surf.skinWidth if surf and surf.skinWidth > 0 else 256
-            s_height = surf.skinHeight if surf and surf.skinHeight > 0 else 256
-
-            for tex_idx in (tri.textureIndices[0], tri.textureIndices[2], tri.textureIndices[1]): #reversed winding to fix normal flipping
-                if tex_idx < len(dkm_data.UV):
-                    uv_coord = dkm_data.UV[tex_idx]
-                    u = uv_coord.s / s_width
-                    v = 1.0 - (uv_coord.t / s_height)
-                    uv_loops.append((u, v))
-                else:
-                    uv_loops.append((0.0, 0.0))
-
-    mesh_name = filepath.stem
-    mesh = bpy.data.meshes.new(mesh_name)
-    obj = bpy.data.objects.new(mesh_name, mesh)
-
-    bpy.context.collection.objects.link(obj)
-    bpy.context.view_layer.objects.active = obj
-    obj.select_set(True)
-
-    mesh.from_pydata(base_vertices, [], faces)
-    mesh.update()
-
-    if dkm_data.skinpaths:
-        for path_str in dkm_data.skinpaths:
-            mat_name = path_str if path_str else "DKM_Material"
-            mat = bpy.data.materials.get(mat_name)
-            if not mat:
-                mat = bpy.data.materials.new(name=mat_name)
-                mat.use_nodes = True
-                mat_nodes = mat.node_tree.nodes
-                mat_links = mat.node_tree.links
-
-                while mat_nodes:
-                    mat_nodes.remove(mat_nodes[0])
-
-                node_diff = mat_nodes.new(type='ShaderNodeBsdfDiffuse')
-                node_out_mat = mat_nodes.new(type='ShaderNodeOutputMaterial')
-                node_out_mat.location = (200, 0)
-                mat_links.new(node_diff.outputs['BSDF'], node_out_mat.inputs['Surface'])
-
-            obj.data.materials.append(mat)
-    else:
-        mat = bpy.data.materials.new(name="Default_DKM_Mat")
-        mat.use_nodes = True
-        mat_nodes = mat.node_tree.nodes
-        mat_links = mat.node_tree.links
-        while mat_nodes:
-            mat_nodes.remove(mat_nodes[0])
-        node_diff = mat_nodes.new(type='ShaderNodeBsdfDiffuse')
-        node_out_mat = mat_nodes.new(type='ShaderNodeOutputMaterial')
-        mat_links.new(node_diff.outputs['BSDF'], node_out_mat.inputs['Surface'])
-        obj.data.materials.append(mat)
-
-    if UVsFromGLCommands:
-        for poly_i, mat_idx in enumerate(poly_material_indices):
-            if poly_i < len(mesh.polygons) and 0 <= mat_idx < len(obj.data.materials):
-                mesh.polygons[poly_i].material_index = mat_idx
-    else:
-        for tri_i, tri in enumerate(dkm_data.triangles):
-            if tri_i < len(mesh.polygons):
-                if dkm_data.surfaces and 0 <= tri.surfaceIndex < len(dkm_data.surfaces):
-                    skin_idx = dkm_data.surfaces[tri.surfaceIndex].skinIndex
-                    if 0 <= skin_idx < len(obj.data.materials):
-                        mesh.polygons[tri_i].material_index = skin_idx
-    if dkm_data.surfaces:
-        for surf_idx, surf in enumerate(dkm_data.surfaces):
-            vg_name = f"DKM__{surf.name}__{surf.skinIndex}.{surf.flags}"
-            vg = obj.vertex_groups.new(name=vg_name)
-            vert_indices = list(surface_vertex_maps.get(surf_idx, []))
-            if vert_indices:
-                vg.add(vert_indices, 1.0, 'REPLACE')
-
-    uv_layer = mesh.uv_layers.new(name="DKM_UVMap")
-    uv_layer_data = uv_layer.data
-    if uv_loops:
-        for i, loop in enumerate(mesh.loops):
-            if i < len(uv_loops):
-                uv_layer_data[i].uv = uv_loops[i]
-
-    if ImportAnimations:
-        _import_animation(obj, dkm_data, TimelineMarkerOptions)
-    print(f"Successfully imported '{mesh_name}'.")
-    return obj
-
-
-def _import_animation(obj, dkm_data, marker_mode: int):
-    basis_key = obj.shape_key_add(name="Basis")
-    basis_key.value = 0.0
-
-    scene = bpy.context.scene
-    scene.frame_start = 0
-
-    for f_idx, frame in enumerate(dkm_data.frames):
-        key_name = frame.name if frame.name else f"Frame_{f_idx:03d}"
-        s_key = obj.shape_key_add(name=key_name, from_mix=False)
-        s_key.relative_key = basis_key
-        s_key.value = 0.0
-
-        f_scale = frame.scale
-        f_translate = frame.translate
-        for v_i, v in enumerate(frame.vertices):
-            s_key.data[v_i].co = (
-                v.vertex[0] * f_scale[0] + f_translate[0],
-                v.vertex[1] * f_scale[1] + f_translate[1],
-                v.vertex[2] * f_scale[2] + f_translate[2])
-
-        s_key.value = 0.0
-        s_key.keyframe_insert(data_path="value", frame=max(0, f_idx - 1))
-        s_key.value = 1.0
-        s_key.keyframe_insert(data_path="value", frame=f_idx)
-        s_key.value = 0.0
-        s_key.keyframe_insert(data_path="value", frame=f_idx + 1)
-
-    scene.frame_end = len(dkm_data.frames) - 1
-
-    if marker_mode == 1:
-        mark = scene.timeline_markers
-        mark.clear()
-        last_name = ""
-        for f_idx, frame in enumerate(dkm_data.frames):
-            raw = frame.name if frame.name else f"frame_{f_idx}"
-            base = raw.rstrip("0123456789_")
-            if base and base != last_name:
-                mark.new(name=base, frame=f_idx)
-                last_name = base
-    elif marker_mode == 2:
-        mark = scene.timeline_markers
-        mark.clear()
-        for seq in dkm_data.sequences:
-            if seq.name:
-                mark.new(name=seq.name, frame=seq.startFrame)
-
-    obj.active_shape_key_index = 0
+from .DKMnormals import light_normal_indices
+from .DaiWal import RGBToDaiWalData, WriteDaiWAL
 
 def build_frame_names(count: int, use_markers: bool, start: int) -> list[str]:
     scene = bpy.context.scene
@@ -273,8 +40,7 @@ def build_frame_names(count: int, use_markers: bool, start: int) -> list[str]:
         names.append(name[:15])
     return names
 
-
-def _material_skin_size(mat) -> tuple[int, int]:
+def _material_image(mat):
     img = None
     if mat is not None:
         if mat.use_nodes and mat.node_tree:
@@ -289,6 +55,10 @@ def _material_skin_size(mat) -> tuple[int, int]:
                         break
         if img is None:
             img = bpy.data.images.get(mat.name) or bpy.data.images.get(Path(mat.name).name)
+    return img
+
+def _material_skin_size(mat) -> tuple[int, int]:
+    img = _material_image(mat)
     if img is not None:
         w, h = img.size
         if w > 0 and h > 0:
@@ -296,6 +66,154 @@ def _material_skin_size(mat) -> tuple[int, int]:
         print(f"Warning: image '{img.name}' has no pixel data; assuming 256x256.")
     return 256, 256
 
+def _image_rgba8(img) -> np.ndarray:
+    w, h = img.size
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    px = np.clip(np.flipud(px.reshape(h, w, 4)), 0.0, 1.0)
+    rgb, alpha = px[..., :3], px[..., 3:]
+    if img.is_float:
+        rgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(rgb, 1 / 2.4) - 0.055)
+    return np.rint(np.concatenate([rgb, alpha], axis=2) * 255.0).astype(np.uint8)
+
+#Texture writers
+#Only TGA uses the alpha channel.
+def _write_wal(out: Path, rgba: np.ndarray) -> str:
+    mipmaps, palette = RGBToDaiWalData(rgba[..., :3])
+    WriteDaiWAL(out, out.stem[:31], mipmaps, palette)
+    return f", {len(mipmaps)} mip levels"
+
+def _write_pcx(out: Path, rgba: np.ndarray) -> str:
+    h, w = rgba.shape[:2]
+    mipmaps, palette = RGBToDaiWalData(rgba[..., :3]) #only mip 0 is used; PCX is always 8-bit paletted here
+    bpl = w + (w & 1) #bytes per line must be even
+    header = bytearray(128)
+    header[0:4] = bytes([10, 5, 1, 8])
+    struct.pack_into("<4H", header, 4, 0, 0, w - 1, h - 1)
+    struct.pack_into("<2H", header, 12, 72, 72)
+    header[65] = 1
+    struct.pack_into("<2H", header, 66, bpl, 1)
+    body = bytearray()
+    for row in mipmaps[0]:
+        line = bytes(row) + b"\x00" * (bpl - w)
+        i = 0
+        while i < bpl:
+            j = i
+            while j < bpl and line[j] == line[i] and j - i < 63:
+                j += 1
+            run = j - i
+            if run > 1 or line[i] >= 0xC0:
+                body += bytes([0xC0 | run, line[i]])
+            else:
+                body.append(line[i])
+            i = j
+    out.write_bytes(bytes(header) + bytes(body) + b"\x0c" + np.asarray(palette, dtype=np.uint8).tobytes())
+    return ", 256 colours"
+
+def _tga_rle_row(row: np.ndarray) -> bytes:
+    #Run-length encodes one scanline (W, channels). Packets never span scanlines.
+    n = row.shape[0]
+    change = np.flatnonzero((row[1:] != row[:-1]).any(axis=1)) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [n]))
+    out = bytearray()
+
+    def flush_raw(a: int, b: int):
+        while a < b:
+            c = min(128, b - a)
+            out.append(c - 1)
+            out.extend(row[a:a + c].tobytes())
+            a += c
+
+    raw_start = None
+    for s, e in zip(starts.tolist(), ends.tolist()):
+        if e - s == 1:
+            if raw_start is None:
+                raw_start = s
+            continue
+        if raw_start is not None:
+            flush_raw(raw_start, s)
+            raw_start = None
+        pixel, left = row[s].tobytes(), e - s
+        while left > 0:
+            c = min(128, left)
+            out.append(0x80 | (c - 1))
+            out.extend(pixel)
+            left -= c
+    if raw_start is not None:
+        flush_raw(raw_start, n)
+    return bytes(out)
+
+def _write_tga(out: Path, rgba: np.ndarray) -> str:
+    #Opaque images become type 2 (uncompressed, 24-bit); images with transparent or translucent pixels
+    #become type 10 (run-length encoded, 32-bit with alpha). Origin is bottom-left.
+    h, w = rgba.shape[:2]
+    translucent = bool((rgba[..., 3] < 255).any())
+    if translucent:
+        pix = np.ascontiguousarray(np.flipud(rgba[..., [2, 1, 0, 3]]))
+        header = struct.pack("<BBBHHBHHHHBB", 0, 0, 10, 0, 0, 0, 0, 0, w, h, 32, 8)
+        out.write_bytes(header + b"".join(_tga_rle_row(row) for row in pix))
+        return ", type 10, 32-bit with alpha"
+    pix = np.flipud(rgba[..., [2, 1, 0]])
+    header = struct.pack("<BBBHHBHHHHBB", 0, 0, 2, 0, 0, 0, 0, 0, w, h, 24, 0)
+    out.write_bytes(header + pix.tobytes())
+    return ", type 2, 24-bit"
+
+def _write_bmp(out: Path, rgba: np.ndarray) -> str:
+    h, w = rgba.shape[:2]
+    mipmaps, palette = RGBToDaiWalData(rgba[..., :3]) #8-bit paletted, bottom-up
+    pad = (-w) % 4
+    pix = np.flipud(mipmaps[0])
+    if pad:
+        pix = np.concatenate([pix, np.zeros((h, pad), dtype=np.uint8)], axis=1)
+    data = pix.tobytes()
+    colours = np.zeros((256, 4), dtype=np.uint8) #BGRA entries
+    colours[:, :3] = np.asarray(palette, dtype=np.uint8)[:, ::-1]
+    offset = 14 + 40 + 1024
+    out.write_bytes(struct.pack("<2sIHHI", b"BM", offset + len(data), 0, 0, offset) +
+                    struct.pack("<IiiHHIIiiII", 40, w, h, 1, 8, 0, len(data), 2835, 2835, 256, 256) +
+                    colours.tobytes() + data)
+    return ", 256 colours"
+
+def _write_png(out: Path, rgba: np.ndarray) -> str:
+    #Raw 32-bit (8-bit RGBA) PNG, so all colours and translucency are kept. The game can't load PNGs, so no palette.
+    h, w = rgba.shape[:2]
+    raw = np.concatenate([np.zeros((h, 1), dtype=np.uint8), rgba.reshape(h, w * 4)], axis=1).tobytes()
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    out.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) +
+                    chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    return ""
+
+TEXTURE_WRITERS = {".wal": _write_wal, ".pcx": _write_pcx, ".tga": _write_tga, ".bmp": _write_bmp, ".png": _write_png}
+
+def _export_textures(folder: Path, skinpaths: list, materials: list):
+    #Writes each skin's texture into `folder`, in the format of the skin path's extension.
+    done = set()
+    for skin, mat in zip(skinpaths, materials):
+        if mat is None: #the default skin has no material
+            continue
+        leaf = Path(skin.replace("\\", "/"))
+        writer = TEXTURE_WRITERS.get(leaf.suffix.lower())
+        if not leaf.stem or writer is None:
+            print(f"Texture: skin '{skin}' doesn't end in a supported extension ({', '.join(TEXTURE_WRITERS)}), skipped.")
+            continue
+        if leaf.name.lower() in done:
+            print(f"Texture: '{leaf.name}' was already written for another skin, skipped '{skin}'.")
+            continue
+        done.add(leaf.name.lower())
+        img = _material_image(mat)
+        if img is None:
+            print(f"Texture: no image found for material '{mat.name}', skipped.")
+            continue
+        w, h = img.size
+        if w == 0 or h == 0:
+            print(f"Texture: image '{img.name}' has no pixel data, skipped.")
+            continue
+        if leaf.suffix.lower() == ".wal" and ((w & (w - 1)) or (h & (h - 1))):
+            print(f"Warning: '{img.name}' is {w}x{h}, not a power of two; mip levels will have odd sizes.")
+        note = writer(folder / leaf.name, _image_rgba8(img))
+        print(f"Texture: wrote '{leaf.name}' ({w}x{h}{note}).")
 
 def _build_sequences(count: int, option: int, start: int, end: int) -> list:
     if option == 0 or count == 0:
@@ -321,7 +239,6 @@ def _build_sequences(count: int, option: int, start: int, end: int) -> list:
         e_frame = starts[i + 1][0] - 1 if i + 1 < len(starts) else count - 1
         seqs.append(DKMAnimSeq(name=name, startFrame=s_frame, endFrame=e_frame))
     return seqs
-
 
 def _build_gl_commands(dkm, surfaces, surface_tris, surf_global, voff):
     for local_idx, tris_in_surf in surface_tris.items():
@@ -422,8 +339,7 @@ def _build_gl_commands(dkm, surfaces, surface_tris, surf_global, voff):
                 surfIndex=surf_global[local_idx],
                 vertices=cmd_verts))
 
-
-def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], SurfacesFromVertexGroups: bool, ExportAnimations: bool, MarkerFrameNames: bool, StartAnimFrame: int, EndAnimFrame: int, AnimSeqOptions: int):
+def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], SurfacesFromVertexGroups: bool, ExportAnimations: bool, MarkerFrameNames: bool, StartAnimFrame: int, EndAnimFrame: int, AnimSeqOptions: int, ExportTextures: bool):
     filepath = Path(filepath)
     if isinstance(objs, bpy.types.Object):
         objs = [objs]
@@ -491,6 +407,7 @@ def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], Surf
         vg_pattern = re.compile(r'^DKM__(.*)__(.+)\.(.+)$')
         skinpaths = []
         skin_sizes = []
+        skin_materials = [] #the material behind each skin path, for exporting textures
 
         def skin_size(idx):
             return skin_sizes[idx] if 0 <= idx < len(skin_sizes) else (256, 256)
@@ -506,12 +423,14 @@ def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], Surf
             return surface_lookup[key]
         vert_offset = 0
 
+        all_tris = []
         for obj, mesh in zip(objs, base_meshes):
             def global_skin(mat):
-                name = mat.name if mat else "default_skin.tga"
+                name = re.sub(r"\.\d{3}$", "", mat.name) if mat else "default_skin.tga" #drop Blender's duplicate suffix
                 if name not in skinpaths:
                     skinpaths.append(name)
                     skin_sizes.append(_material_skin_size(mat))
+                    skin_materials.append(mat)
                 return skinpaths.index(name)
 
             skin_map = [global_skin(mat) for mat in mesh.materials]
@@ -585,10 +504,11 @@ def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], Surf
                     tri_tex_indices.append(uv_dict[key])
 
                 v = [vi + vert_offset for vi in tri.vertices]
+                all_tris.append(v) #regular winding, for normals
                 dkm.triangles.append(DKMTriangle(
                     surfaceIndex=surf_global[assigned],
                     num_uvframes=1,
-                    vertexIndices=[v[0], v[2], v[1]],        # reversed winding
+                    vertexIndices=[v[0], v[2], v[1]], #reversed winding
                     textureIndices=[tri_tex_indices[0], tri_tex_indices[2], tri_tex_indices[1]]))
                 surface_tris[assigned].append((tri_idx, tri, tri_tex_indices))
 
@@ -605,14 +525,17 @@ def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], Surf
         qmax = np.array([255, 255, 255] if ModelVersion == 1 else [2047, 1023, 2047], dtype=np.float64)
         names = build_frame_names(len(frame_coords), MarkerFrameNames, StartAnimFrame)
 
+        all_tris = np.array(all_tris, dtype=np.int64).reshape(-1, 3)
         frames = []
         for name, co in zip(names, frame_coords):
+            normal_idx = light_normal_indices(co, all_tris)
             mn = co.min(axis=0)
             rng = co.max(axis=0) - mn
             scale = np.where(rng > 0, rng / qmax, 1.0)
             q = np.clip(np.rint((co - mn) / scale), 0, qmax).astype(int)
-            frame_verts = [DKMTriangleVertex(vertex=[int(a), int(b), int(c)], lightNormalIndex=0)
-                           for a, b, c in q]
+            frame_verts = [DKMTriangleVertex(vertex=[int(a), int(b), int(c)],
+                                             lightNormalIndex=int(n))
+                           for (a, b, c), n in zip(q, normal_idx)]
             frames.append(DKMFrame(scale=[float(s) for s in scale],
                                    translate=[float(t) for t in mn],
                                    name=name, vertices=frame_verts, unknown=[0, 0, 0]))
@@ -620,6 +543,8 @@ def export_dkm_file(filepath, objs, ModelVersion: int, origin: list[float], Surf
         dkm.sequences = _build_sequences(len(frames), AnimSeqOptions, StartAnimFrame, EndAnimFrame)
 
         write_dkm(dkm, filepath)
+        if ExportTextures:
+            _export_textures(filepath.parent, skinpaths, skin_materials)
         print(f"Successfully exported {len(objs)} object(s) to '{filepath.name}'.")
         return True
 
